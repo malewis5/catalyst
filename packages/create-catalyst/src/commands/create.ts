@@ -7,13 +7,15 @@ import kebabCase from 'lodash.kebabcase';
 import { join } from 'path';
 import { z } from 'zod';
 
-import { checkStorefrontLimit } from '../utils/check-storefront-limit';
 import { cloneCatalyst } from '../utils/clone-catalyst';
 import { Https } from '../utils/https';
 import { installDependencies } from '../utils/install-dependencies';
 import { login } from '../utils/login';
 import { parse } from '../utils/parse';
+import { Telemetry } from '../utils/telemetry/telemetry';
 import { writeEnv } from '../utils/write-env';
+
+const telemetry = new Telemetry();
 
 export const create = new Command('create')
   .description('Command to scaffold and connect a Catalyst storefront to your BigCommerce store')
@@ -23,7 +25,8 @@ export const create = new Command('create')
   .option('--access-token <token>', 'BigCommerce access token')
   .option('--channel-id <id>', 'BigCommerce channel ID')
   .option('--customer-impersonation-token <token>', 'BigCommerce customer impersonation token')
-  .option('--gh-ref <ref>', 'Clone a specific ref from the bigcommerce/catalyst repository')
+  .option('--gh-ref <ref>', 'Clone a specific ref from the source repository')
+  .option('--repository <repository>', 'GitHub repository to clone from', 'bigcommerce/catalyst')
   .addOption(
     new Option('--bigcommerce-hostname <hostname>', 'BigCommerce hostname')
       .default('bigcommerce.com')
@@ -36,7 +39,7 @@ export const create = new Command('create')
   )
   // eslint-disable-next-line complexity
   .action(async (options) => {
-    const { ghRef } = options;
+    const { ghRef, repository } = options;
 
     try {
       execSync('which git', { stdio: 'ignore' });
@@ -120,7 +123,7 @@ export const create = new Command('create')
     if (!storeHash || !accessToken) {
       console.log(`\nCreating '${projectName}' at '${projectDir}'\n`);
 
-      cloneCatalyst({ projectDir, projectName, ghRef });
+      cloneCatalyst({ repository, projectName, projectDir, ghRef });
 
       await installDependencies(projectDir);
 
@@ -136,16 +139,26 @@ export const create = new Command('create')
       process.exit(0);
     }
 
+    // At this point we should have a storeHash and can identify the account
+    await telemetry.identify(storeHash);
+
     if (!channelId || !customerImpersonationToken) {
       const bc = new Https({ bigCommerceApiUrl: bigcommerceApiUrl, storeHash, accessToken });
-      const availableChannels = await bc.channels('?available=true&type=storefront');
-      const storeInfo = await bc.storeInformation();
+      const sampleDataApi = new Https({
+        sampleDataApiUrl,
+        storeHash,
+        accessToken,
+      });
 
-      const canCreateChannel = checkStorefrontLimit(availableChannels, storeInfo);
+      const eligibilityResponse = await sampleDataApi.checkEligibility();
+
+      if (!eligibilityResponse.data.eligible) {
+        console.warn(chalk.yellow(eligibilityResponse.data.message));
+      }
 
       let shouldCreateChannel;
 
-      if (canCreateChannel) {
+      if (eligibilityResponse.data.eligible) {
         shouldCreateChannel = await select({
           message: 'Would you like to create a new channel?',
           choices: [
@@ -158,12 +171,6 @@ export const create = new Command('create')
       if (shouldCreateChannel) {
         const newChannelName = await input({
           message: 'What would you like to name your new channel?',
-        });
-
-        const sampleDataApi = new Https({
-          sampleDataApiUrl,
-          storeHash,
-          accessToken,
         });
 
         const {
@@ -182,6 +189,8 @@ export const create = new Command('create')
 
       if (!shouldCreateChannel) {
         const channelSortOrder = ['catalyst', 'next', 'bigcommerce'];
+
+        const availableChannels = await bc.channels('?available=true&type=storefront');
 
         const existingChannel = await select({
           message: 'Which channel would you like to use?',
@@ -216,7 +225,7 @@ export const create = new Command('create')
 
     console.log(`\nCreating '${projectName}' at '${projectDir}'\n`);
 
-    cloneCatalyst({ projectDir, projectName, ghRef });
+    cloneCatalyst({ repository, projectName, projectDir, ghRef });
 
     writeEnv(projectDir, {
       channelId: channelId.toString(),
